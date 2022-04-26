@@ -131,6 +131,14 @@ public partial class ConcurrentCache<TKey, TValue>
 
     private void OnRemoved() => Interlocked.Decrement(ref count);
 
+    private static bool EqualKey(TKey left, TKey rigth, IEqualityComparer<TKey>? comparer)
+    {
+        if (comparer is null)
+            return typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(left, rigth) : left.Equals(rigth);
+
+        return comparer.Equals(left, rigth);
+    }
+
     private bool TryAdd(TKey key, IEqualityComparer<TKey>? keyComparer, int hashCode, TValue value, bool updateIfExists, out TValue? previous)
     {
         ref var bucket = ref GetBucket(hashCode, out var bucketLock);
@@ -140,44 +148,21 @@ public partial class ConcurrentCache<TKey, TValue>
 
         lock (bucketLock)
         {
-            if (keyComparer is null)
+            for (KeyValuePair? current = Volatile.Read(ref bucket); current is not null; current = current.Next)
             {
-                for (KeyValuePair? current = Volatile.Read(ref bucket); current is not null; current = current.Next)
+                if (hashCode == current.KeyHashCode && EqualKey(current.Key, key, keyComparer))
                 {
-                    if (hashCode == current.KeyHashCode && (typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(key, current.Key) : current.Key.Equals(key)))
+                    previous = GetValue(current);
+                    result = false;
+                    if (updateIfExists)
                     {
-                        previous = GetValue(current);
-                        result = false;
-                        if (updateIfExists)
-                        {
-                            SetValue(current, value);
-                            command = readCommand;
-                            pair = current;
-                            goto enqueue_and_exit;
-                        }
-
-                        goto exit;
+                        SetValue(current, value);
+                        command = readCommand;
+                        pair = current;
+                        EnqueueAndDrain(command, pair);
                     }
-                }
-            }
-            else
-            {
-                for (KeyValuePair? current = Volatile.Read(ref bucket); current is not null; current = current.Next)
-                {
-                    if (hashCode == current.KeyHashCode && keyComparer.Equals(key, current.Key))
-                    {
-                        previous = GetValue(current);
-                        result = false;
-                        if (updateIfExists)
-                        {
-                            SetValue(current, value);
-                            command = readCommand;
-                            pair = current;
-                            goto enqueue_and_exit;
-                        }
 
-                        goto exit;
-                    }
+                    return result;
                 }
             }
 
@@ -192,10 +177,7 @@ public partial class ConcurrentCache<TKey, TValue>
             OnAdded();
         }
 
-    enqueue_and_exit:
         EnqueueAndDrain(command, pair);
-
-    exit:
         return result;
     }
 
@@ -210,6 +192,8 @@ public partial class ConcurrentCache<TKey, TValue>
         get => TryGetValue(key, out var value) ? value : throw new KeyNotFoundException();
         set
         {
+            ArgumentNullException.ThrowIfNull(key);
+
             var keyComparer = this.keyComparer;
             var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
             TryAdd(key, keyComparer, hashCode, value, updateIfExists: true, out _);
@@ -224,6 +208,8 @@ public partial class ConcurrentCache<TKey, TValue>
     /// <returns><see langword="true"/> if the entry is added successfully; otherwise, <see langword="false"/>.</returns>
     public bool TryAdd(TKey key, TValue value)
     {
+        ArgumentNullException.ThrowIfNull(key);
+
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
         return TryAdd(key, keyComparer, hashCode, value, updateIfExists: false, out _);
@@ -244,6 +230,8 @@ public partial class ConcurrentCache<TKey, TValue>
     /// </returns>
     public TValue AddOrUpdate(TKey key, TValue value, out bool added)
     {
+        ArgumentNullException.ThrowIfNull(key);
+
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
 
@@ -268,6 +256,8 @@ public partial class ConcurrentCache<TKey, TValue>
     /// </returns>
     public TValue GetOrAdd(TKey key, TValue value, out bool added)
     {
+        ArgumentNullException.ThrowIfNull(key);
+
         TValue? result;
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
@@ -292,6 +282,8 @@ public partial class ConcurrentCache<TKey, TValue>
     /// <returns><see langword="true"/> if the cache entry exists; otherwise, <see langword="false"/>.</returns>
     public bool TryGetValue(TKey key, [MaybeNullWhen(false)] out TValue value)
     {
+        ArgumentNullException.ThrowIfNull(key);
+
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
         return TryGetValue(key, keyComparer, hashCode, out value);
@@ -301,28 +293,13 @@ public partial class ConcurrentCache<TKey, TValue>
     {
         KeyValuePair? pair;
 
-        if (keyComparer is null)
+        for (pair = Volatile.Read(ref GetBucket(hashCode)); pair is not null; pair = pair.Next)
         {
-            for (pair = Volatile.Read(ref GetBucket(hashCode)); pair is not null; pair = pair.Next)
+            if (hashCode == pair.KeyHashCode && EqualKey(key, pair.Key, keyComparer))
             {
-                if (hashCode == pair.KeyHashCode && (typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(key, pair.Key) : pair.Key.Equals(key)))
-                {
-                    EnqueueAndDrain(readCommand, pair);
-                    value = GetValue(pair);
-                    return true;
-                }
-            }
-        }
-        else
-        {
-            for (pair = Volatile.Read(ref GetBucket(hashCode)); pair is not null; pair = pair.Next)
-            {
-                if (hashCode == pair.KeyHashCode && keyComparer.Equals(key, pair.Key))
-                {
-                    EnqueueAndDrain(readCommand, pair);
-                    value = GetValue(pair);
-                    return true;
-                }
+                EnqueueAndDrain(readCommand, pair);
+                value = GetValue(pair);
+                return true;
             }
         }
 
@@ -373,50 +350,27 @@ public partial class ConcurrentCache<TKey, TValue>
 
         lock (bucketLock)
         {
-            if (keyComparer is null)
+            for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
             {
-                for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
+                if (hashCode == current.KeyHashCode && EqualKey(key, current.Key, keyComparer) && (!matchValue || EqualityComparer<TValue>.Default.Equals(value, GetValue(current))))
                 {
-                    if (hashCode == current.KeyHashCode && (typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(key, current.Key) : current.Key.Equals(key)) && (!matchValue || EqualityComparer<TValue>.Default.Equals(value, GetValue(current))))
-                    {
-                        pair = current;
-                        if (previous is null)
-                            Volatile.Write(ref bucket, current.Next);
-                        else
-                            previous.Next = current.Next;
+                    pair = current;
+                    if (previous is null)
+                        Volatile.Write(ref bucket, current.Next);
+                    else
+                        previous.Next = current.Next;
 
-                        OnRemoved();
-                        value = GetValue(current);
-                        goto enqueue_and_exit;
-                    }
-                }
-            }
-            else
-            {
-                for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
-                {
-                    if (hashCode == current.KeyHashCode && keyComparer.Equals(key, current.Key) && (!matchValue || EqualityComparer<TValue>.Default.Equals(value, GetValue(current))))
-                    {
-                        pair = current;
-                        if (previous is null)
-                            Volatile.Write(ref bucket, current.Next);
-                        else
-                            previous.Next = current.Next;
+                    OnRemoved();
+                    value = GetValue(current);
 
-                        OnRemoved();
-                        value = GetValue(current);
-                        goto enqueue_and_exit;
-                    }
+                    EnqueueAndDrain(removeCommand, pair);
+                    return true;
                 }
             }
 
             value = default;
             return false;
         }
-
-    enqueue_and_exit:
-        EnqueueAndDrain(removeCommand, pair);
-        return true;
     }
 
     /// <summary>
@@ -438,35 +392,19 @@ public partial class ConcurrentCache<TKey, TValue>
 
         lock (bucketLock)
         {
-            if (keyComparer is null)
+            for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
             {
-                for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
+                if (hashCode == current.KeyHashCode && EqualKey(key, current.Key, keyComparer) && EqualityComparer<TValue>.Default.Equals(expectedValue, GetValue(current)))
                 {
-                    if (hashCode == current.KeyHashCode && (typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(key, current.Key) : current.Key.Equals(key)) && EqualityComparer<TValue>.Default.Equals(expectedValue, GetValue(current)))
-                    {
-                        SetValue(pair = current, newValue);
-                        goto enqueue_and_exit;
-                    }
-                }
-            }
-            else
-            {
-                for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
-                {
-                    if (hashCode == current.KeyHashCode && keyComparer.Equals(key, current.Key) && EqualityComparer<TValue>.Default.Equals(expectedValue, GetValue(current)))
-                    {
-                        SetValue(pair = current, newValue);
-                        goto enqueue_and_exit;
-                    }
+                    SetValue(pair = current, newValue);
+                    EnqueueAndDrain(readCommand, pair);
+
+                    return true;
                 }
             }
 
             return false;
         }
-
-    enqueue_and_exit:
-        EnqueueAndDrain(readCommand, pair);
-        return true;
     }
 
     private int AcquireAllLocks()
