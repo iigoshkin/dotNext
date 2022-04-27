@@ -131,12 +131,12 @@ public partial class ConcurrentCache<TKey, TValue>
 
     private void OnRemoved() => Interlocked.Decrement(ref count);
 
-    private static bool EqualKey(TKey left, TKey rigth, IEqualityComparer<TKey>? comparer)
+    private bool EqualComparerKey(TKey left, TKey right, IEqualityComparer<TKey>? keyComparer)
     {
-        if (comparer is null)
-            return typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(left, rigth) : left.Equals(rigth);
+        if (keyComparer is null)
+            return typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(left, right) : left.Equals(right);
 
-        return comparer.Equals(left, rigth);
+        return keyComparer.Equals(left, right);
     }
 
     private bool TryAdd(TKey key, IEqualityComparer<TKey>? keyComparer, int hashCode, TValue value, bool updateIfExists, out TValue? previous)
@@ -150,7 +150,7 @@ public partial class ConcurrentCache<TKey, TValue>
         {
             for (KeyValuePair? current = Volatile.Read(ref bucket); current is not null; current = current.Next)
             {
-                if (hashCode == current.KeyHashCode && EqualKey(current.Key, key, keyComparer))
+                if (hashCode == current.KeyHashCode && EqualComparerKey(key, current.Key, keyComparer))
                 {
                     previous = GetValue(current);
                     result = false;
@@ -159,7 +159,9 @@ public partial class ConcurrentCache<TKey, TValue>
                         SetValue(current, value);
                         command = readCommand;
                         pair = current;
+
                         EnqueueAndDrain(command, pair);
+                        return result;
                     }
 
                     return result;
@@ -192,8 +194,6 @@ public partial class ConcurrentCache<TKey, TValue>
         get => TryGetValue(key, out var value) ? value : throw new KeyNotFoundException();
         set
         {
-            ArgumentNullException.ThrowIfNull(key);
-
             var keyComparer = this.keyComparer;
             var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
             TryAdd(key, keyComparer, hashCode, value, updateIfExists: true, out _);
@@ -208,8 +208,6 @@ public partial class ConcurrentCache<TKey, TValue>
     /// <returns><see langword="true"/> if the entry is added successfully; otherwise, <see langword="false"/>.</returns>
     public bool TryAdd(TKey key, TValue value)
     {
-        ArgumentNullException.ThrowIfNull(key);
-
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
         return TryAdd(key, keyComparer, hashCode, value, updateIfExists: false, out _);
@@ -230,8 +228,6 @@ public partial class ConcurrentCache<TKey, TValue>
     /// </returns>
     public TValue AddOrUpdate(TKey key, TValue value, out bool added)
     {
-        ArgumentNullException.ThrowIfNull(key);
-
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
 
@@ -256,8 +252,6 @@ public partial class ConcurrentCache<TKey, TValue>
     /// </returns>
     public TValue GetOrAdd(TKey key, TValue value, out bool added)
     {
-        ArgumentNullException.ThrowIfNull(key);
-
         TValue? result;
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
@@ -282,8 +276,6 @@ public partial class ConcurrentCache<TKey, TValue>
     /// <returns><see langword="true"/> if the cache entry exists; otherwise, <see langword="false"/>.</returns>
     public bool TryGetValue(TKey key, [MaybeNullWhen(false)] out TValue value)
     {
-        ArgumentNullException.ThrowIfNull(key);
-
         var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
         return TryGetValue(key, keyComparer, hashCode, out value);
@@ -295,7 +287,7 @@ public partial class ConcurrentCache<TKey, TValue>
 
         for (pair = Volatile.Read(ref GetBucket(hashCode)); pair is not null; pair = pair.Next)
         {
-            if (hashCode == pair.KeyHashCode && EqualKey(key, pair.Key, keyComparer))
+            if (hashCode == pair.KeyHashCode && EqualComparerKey(key, pair.Key, keyComparer))
             {
                 EnqueueAndDrain(readCommand, pair);
                 value = GetValue(pair);
@@ -343,7 +335,6 @@ public partial class ConcurrentCache<TKey, TValue>
 
     private bool TryRemove(TKey key, bool matchValue, ref TValue? value)
     {
-        var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
         ref var bucket = ref GetBucket(hashCode, out var bucketLock);
         KeyValuePair pair;
@@ -352,7 +343,7 @@ public partial class ConcurrentCache<TKey, TValue>
         {
             for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
             {
-                if (hashCode == current.KeyHashCode && EqualKey(key, current.Key, keyComparer) && (!matchValue || EqualityComparer<TValue>.Default.Equals(value, GetValue(current))))
+                if (hashCode == current.KeyHashCode && EqualComparerKey(key, current.Key, keyComparer) && (!matchValue || EqualityComparer<TValue>.Default.Equals(value, GetValue(current))))
                 {
                     pair = current;
                     if (previous is null)
@@ -385,7 +376,6 @@ public partial class ConcurrentCache<TKey, TValue>
     /// </returns>
     public bool TryUpdate(TKey key, TValue newValue, TValue expectedValue)
     {
-        var keyComparer = this.keyComparer;
         var hashCode = keyComparer?.GetHashCode(key) ?? key.GetHashCode();
         ref var bucket = ref GetBucket(hashCode, out var bucketLock);
         KeyValuePair pair;
@@ -394,11 +384,10 @@ public partial class ConcurrentCache<TKey, TValue>
         {
             for (KeyValuePair? current = Volatile.Read(ref bucket), previous = null; current is not null; previous = current, current = current.Next)
             {
-                if (hashCode == current.KeyHashCode && EqualKey(key, current.Key, keyComparer) && EqualityComparer<TValue>.Default.Equals(expectedValue, GetValue(current)))
+                if (hashCode == current.KeyHashCode && EqualComparerKey(key, current.Key, keyComparer) && EqualityComparer<TValue>.Default.Equals(expectedValue, GetValue(current)))
                 {
                     SetValue(pair = current, newValue);
                     EnqueueAndDrain(readCommand, pair);
-
                     return true;
                 }
             }
