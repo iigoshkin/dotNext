@@ -131,7 +131,7 @@ public partial class ConcurrentCache<TKey, TValue>
 
     private void OnRemoved() => Interlocked.Decrement(ref count);
 
-    private bool EqualComparerKey(TKey left, TKey right, IEqualityComparer<TKey>? keyComparer)
+    private static bool EqualComparerKey(TKey left, TKey right, IEqualityComparer<TKey>? keyComparer)
     {
         if (keyComparer is null)
             return typeof(TKey).IsValueType ? EqualityComparer<TKey>.Default.Equals(left, right) : left.Equals(right);
